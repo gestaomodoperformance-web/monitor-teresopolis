@@ -1,6 +1,6 @@
-selenium==4.18.1
-webdriver-manager==4.0.1
-requests==2.31.0
-pdfplumber==0.10.3
-openai>=1.60.0
-httpx>=0.27.0
+selenium
+requests
+pdfplumber
+webdriver-manager
+openai
+python-dotenv
