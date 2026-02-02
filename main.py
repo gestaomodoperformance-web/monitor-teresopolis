@@ -1,8 +1,8 @@
 import os
 import time
+import json
 import requests
 import pdfplumber
-import base64
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -19,7 +19,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- 1. CONFIGURAÇÃO DO DRIVER ---
+# --- 1. DRIVER COM ESCUTA DE REDE (A Mágica) ---
 def configurar_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new") 
@@ -28,7 +28,10 @@ def configurar_driver():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--ignore-certificate-errors")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # ATIVANDO O LOG DE PERFORMANCE (Para interceptar o link do PDF)
+    chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
     
     try:
         caminho = ChromeDriverManager().install()
@@ -41,132 +44,130 @@ def configurar_driver():
     except:
         return webdriver.Chrome(options=chrome_options)
 
-# --- 2. SCRAPER ---
+# --- 2. FUNÇÃO FAREJADORA ---
+def encontrar_pdf_nos_logs(driver):
+    print("👃 Farejando tráfego de rede em busca do PDF real...")
+    logs = driver.get_log('performance')
+    
+    candidatos = []
+    
+    for entry in logs:
+        try:
+            message = json.loads(entry['message'])['message']
+            
+            # Procura requisições de resposta (Response)
+            if message['method'] == 'Network.responseReceived':
+                url = message['params']['response']['url']
+                mime_type = message['params']['response']['mimeType']
+                
+                # O Pulo do Gato: Se o tipo for PDF ou a URL tiver cara de API de download
+                if "application/pdf" in mime_type or ".pdf" in url or "download" in url:
+                    # Ignora scripts .js ou css
+                    if ".js" not in url and ".css" not in url and ".html" not in url:
+                        candidatos.append(url)
+        except:
+            pass
+            
+    # Retorna o último encontrado (geralmente é o clique mais recente)
+    if candidatos:
+        return candidatos[-1]
+    return None
+
+# --- 3. SCRAPER PRINCIPAL ---
 def buscar_e_baixar_diario():
-    url = "https://atos.teresopolis.rj.gov.br/diario/"
+    url_portal = "https://atos.teresopolis.rj.gov.br/diario/"
     caminho_pdf = "/tmp/diario_hoje.pdf" if os.name != 'nt' else "diario_hoje.pdf"
     driver = None
     
-    print(f"🕵️  Acessando: {url}")
+    print(f"🕵️  Acessando: {url_portal}")
     
     try:
         driver = configurar_driver()
         driver.set_page_load_timeout(90)
-        driver.get(url)
+        driver.get(url_portal)
         
-        # Espera a lista carregar procurando pela palavra "Ano" ou "Edição"
+        # Espera lista carregar
         wait = WebDriverWait(driver, 30)
-        print("⏳ Aguardando carregamento da lista...")
-        
-        # Procura elementos que contenham "Edição" E "Ano" (Baseado no seu Log)
+        print("⏳ Aguardando lista...")
         xpath_linha = "//*[contains(text(), 'Edição') and contains(text(), 'Ano')]"
         wait.until(EC.presence_of_all_elements_located((By.XPATH, xpath_linha)))
         
-        # Pega todos os candidatos
+        # Encontra o elemento
         elementos = driver.find_elements(By.XPATH, xpath_linha)
-        
-        alvo_real = None
+        alvo = None
         for elem in elementos:
-            # Filtra elementos vazios ou invisíveis
-            if elem.text and len(elem.text) > 5 and "202" in elem.text: # Busca algo com ano 202x
-                alvo_real = elem
+            if elem.text and "202" in elem.text:
+                alvo = elem
                 break
         
-        if alvo_real:
-            print(f"🎯 Clique Confirmado em: '{alvo_real.text}'")
+        if alvo:
+            print(f"🎯 Clicando em: '{alvo.text}'")
+            # Limpa os logs antigos antes de clicar
+            driver.get_log('performance')
             
-            # Clica via JavaScript para garantir
-            driver.execute_script("arguments[0].click();", alvo_real)
+            # Clica
+            driver.execute_script("arguments[0].click();", alvo)
             
-            print("👆 Clicado. Aguardando abertura do documento (15s)...")
+            print("⏳ Aguardando requisição do arquivo (15s)...")
             time.sleep(15)
             
-            link_final = None
+            # TENTA FAREJAR A URL REAL NO NETWORK
+            url_real = encontrar_pdf_nos_logs(driver)
             
-            # --- ESTRATÉGIA 1: Nova Aba ---
-            if len(driver.window_handles) > 1:
-                driver.switch_to.window(driver.window_handles[-1])
-                link_final = driver.current_url
-                print("📑 Nova aba detectada.")
-
-            # --- ESTRATÉGIA 2: Visualizador Embutido (Embed/Iframe) ---
-            else:
-                print("🔍 Procurando PDF embutido na página...")
-                try:
-                    # Procura tags <embed>, <iframe> ou <object> que tenham pdf no src
-                    pdf_embed = driver.execute_script("""
-                        var tags = document.querySelectorAll('embed, iframe, object');
-                        for(var i=0; i<tags.length; i++){
-                            if(tags[i].src && tags[i].src.includes('blob')){
-                                return tags[i].src;
-                            }
-                            if(tags[i].src && tags[i].src.includes('.pdf')){
-                                return tags[i].src;
-                            }
-                        }
-                        return null;
-                    """)
-                    
-                    if pdf_embed:
-                        link_final = pdf_embed
-                        print(f"🔗 PDF Embutido encontrado: {link_final}")
-                    else:
-                        link_final = driver.current_url # Tenta a URL atual como fallback
-                except:
-                    pass
-
-            # --- DOWNLOAD ---
-            if link_final:
-                print(f"⬇️ Baixando de: {link_final}")
+            # SE NÃO ACHOU NO LOG, TENTA MONTAR A URL DA API (Plano B)
+            if not url_real:
+                # O URL atual é .../diario/3240. O ID é 3240.
+                url_atual = driver.current_url
+                if "/diario/" in url_atual:
+                    try:
+                        id_diario = url_atual.split("/")[-1]
+                        # Padrão comum da API da Atos/Mentor
+                        url_real = f"https://atos.teresopolis.rj.gov.br/api/editions/download/{id_diario}"
+                        print(f"⚠️ Log vazio. Tentando URL montada manualmente: {url_real}")
+                    except:
+                        pass
+            
+            if url_real:
+                print(f"⬇️ Baixando URL Real: {url_real}")
                 
-                # Se for BLOB (Blob:https://...), precisa de JS especial
-                if "blob:" in link_final:
-                    js_blob = """
-                        var uri = arguments[0];
-                        var callback = arguments[1];
-                        var xhr = new XMLHttpRequest();
-                        xhr.responseType = 'blob';
-                        xhr.onload = function() {
-                            var reader = new FileReader();
-                            reader.onloadend = function() { callback(reader.result); }
-                            reader.readAsDataURL(xhr.response);
-                        };
-                        xhr.open('GET', uri);
-                        xhr.send();
-                    """
-                    base64_data = driver.execute_async_script(js_blob, link_final)
-                    data = base64.b64decode(base64_data.split(',')[1])
-                    with open(caminho_pdf, 'wb') as f:
-                        f.write(data)
+                # Download com headers simulando o navegador
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://atos.teresopolis.rj.gov.br/"
+                }
+                
+                resp = requests.get(url_real, headers=headers, stream=True, verify=False)
+                
+                with open(caminho_pdf, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                # Verifica se o arquivo é válido (tem cabeçalho de PDF ou tamanho decente)
+                if os.path.exists(caminho_pdf) and os.path.getsize(caminho_pdf) > 2000:
+                    # Verifica cabeçalho do arquivo
+                    with open(caminho_pdf, 'rb') as f:
+                        header = f.read(4)
+                        if b'%PDF' in header:
+                            print("✅ Arquivo validado: É um PDF real!")
+                            return caminho_pdf, url_real
+                        else:
+                            print("⚠️ Arquivo baixado não começa com %PDF. Tentando ler mesmo assim...")
+                            return caminho_pdf, url_real
                 else:
-                    # Download HTTP normal
-                    resp = requests.get(link_final, stream=True, verify=False)
-                    with open(caminho_pdf, 'wb') as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
-
-                # Verifica se baixou algo útil (>1KB)
-                if os.path.exists(caminho_pdf) and os.path.getsize(caminho_pdf) > 1000:
-                    print("💾 PDF Salvo com Sucesso.")
-                    return caminho_pdf, link_final
-                else:
-                    print("⚠️ Arquivo baixado vazio ou inválido.")
+                    print("❌ Arquivo baixado muito pequeno (provavelmente erro).")
             else:
-                print("❌ Não foi possível extrair a URL do PDF após o clique.")
-
-        else:
-            print("❌ Nenhum texto 'Edição/Ano' visível encontrado.")
-
+                print("❌ Não foi possível interceptar a URL do PDF.")
+        
         return None, None
 
     except Exception as e:
-        print(f"❌ ERRO TÉCNICO: {e}")
+        print(f"❌ ERRO GERAL: {e}")
         return None, None
     finally:
         if driver:
             driver.quit()
 
-# --- 3. EXTRATOR ---
+# --- 4. EXTRATOR ---
 def extrair_texto(caminho):
     try:
         text = ""
@@ -174,10 +175,11 @@ def extrair_texto(caminho):
             for page in pdf.pages:
                 text += page.extract_text() or ""
         return text[:100000]
-    except:
+    except Exception as e:
+        print(f"❌ Erro leitura PDF: {e}")
         return ""
 
-# --- 4. IA ---
+# --- 5. IA ---
 def analisar(texto):
     print("🧠 Analisando...")
     prompt = """
@@ -202,17 +204,16 @@ def analisar(texto):
     except:
         return "ND"
 
-# --- 5. TELEGRAM ---
+# --- 6. TELEGRAM ---
 def enviar_telegram(msg, link):
     print("📲 Enviando Telegram...")
-    texto_base = f"📊 *Monitor Teresópolis*\nℹ️ Nenhuma oportunidade comercial hoje.\n🔗 [Link Original]({link})"
-    
-    if msg and "ND" not in msg and "Nenhuma" not in msg:
-        texto_base = f"📊 *Monitor Teresópolis*\n🚀 *Oportunidades Encontradas!*\n\n{msg}\n\n🔗 [Baixar Edital]({link})"
+    texto = f"📊 *Monitor Teresópolis*\nℹ️ Nenhuma oportunidade comercial hoje.\n🔗 [Link]({link})"
+    if msg and "ND" not in msg:
+        texto = f"📊 *Monitor Teresópolis*\n🚀 *Oportunidades!*\n\n{msg}\n\n🔗 [Link]({link})"
         
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": texto_base,
+        "text": texto,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     })
@@ -221,14 +222,14 @@ def main():
     pdf, link = buscar_e_baixar_diario()
     if pdf and link:
         texto = extrair_texto(pdf)
-        if len(texto) > 50:
+        if len(texto) > 100:
             resumo = analisar(texto)
             enviar_telegram(resumo, link)
-            print("✅ CICLO COMPLETO COM SUCESSO.")
+            print("✅ SUCESSO TOTAL.")
         else:
-            print("⚠️ PDF lido, mas sem texto (imagem?).")
+            print("⚠️ PDF sem texto legível.")
     else:
-        print("❌ FALHA NO PROCESSO.")
+        print("❌ FALHA NO DOWNLOAD.")
 
 if __name__ == "__main__":
     main()
