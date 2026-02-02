@@ -1,5 +1,7 @@
 import os
 import time
+import glob
+import json
 import requests
 import pdfplumber
 import urllib3
@@ -12,174 +14,193 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from openai import OpenAI
 
-# --- CONFIGURAÇÕES GERAIS ---
-# Desabilita avisos de segurança SSL (limpa o log)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# --- CONFIGURAÇÕES ---
+# Tenta carregar .env apenas se existir (para testes locais)
+try:
+    from dotenv import load_dotenv
+    load_dotenv("Chaves.env")
+except:
+    pass
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Validação de Segurança
+if not OPENAI_API_KEY:
+    print("❌ ERRO: Chaves de API não configuradas nos Secrets!")
+    exit(1)
 
-# --- 1. CONFIGURAÇÃO DO DRIVER ---
+client = OpenAI(api_key=OPENAI_API_KEY)
+urllib3.disable_warnings()
+
+# --- 1. CONFIGURAÇÃO DO DRIVER (Modo Nuvem) ---
 def configurar_driver():
     chrome_options = Options()
-    chrome_options.add_argument("--headless=new") 
+    
+    # --- OBRIGATÓRIO PARA GITHUB ACTIONS ---
+    chrome_options.add_argument("--headless=new") # Roda sem interface
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--ignore-certificate-errors")
     
-    # Otimização de carregamento
-    chrome_options.page_load_strategy = 'eager' # Não espera carregar imagens/css pesados
+    # Configura pasta de download fixa no ambiente Linux
+    pasta_download = os.getcwd()
+    prefs = {
+        "download.default_directory": pasta_download,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "plugins.always_open_pdf_externally": True, # Força baixar PDF
+        "profile.default_content_settings.popups": 0
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
     
-    try:
-        caminho = ChromeDriverManager().install()
-        if "THIRD_PARTY_NOTICES" in caminho:
-            pasta = os.path.dirname(caminho)
-            caminho = os.path.join(pasta, "chromedriver")
-        os.chmod(caminho, 0o755)
-        service = Service(executable_path=caminho)
-        return webdriver.Chrome(service=service, options=chrome_options)
-    except:
-        return webdriver.Chrome(options=chrome_options)
+    print(f"📂 Pasta de Download configurada: {pasta_download}")
+    
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=chrome_options)
 
-# --- 2. SCRAPER BLINDADO ---
-def buscar_e_baixar_diario():
-    url_portal = "https://atos.teresopolis.rj.gov.br/diario/"
-    caminho_pdf = "diario_hoje.pdf" if os.name == 'nt' else "/tmp/diario_hoje.pdf"
-    driver = None
+# --- 2. CAÇADOR DE ARQUIVOS ---
+def esperar_download(pasta, timeout=90):
+    print("👀 Vigiando pasta por novos arquivos...")
+    fim = time.time() + timeout
     
-    print("--- ETAPA 1: INICIANDO ACESSO ---")
+    while time.time() < fim:
+        # Procura qualquer PDF na pasta
+        arquivos = glob.glob(os.path.join(pasta, "*.pdf"))
+        
+        # Filtra para pegar apenas o que foi modificado agora
+        if arquivos:
+            recente = max(arquivos, key=os.path.getmtime)
+            # Se o arquivo tiver mais de 10 segundos de idade, é velho, ignora
+            if time.time() - os.path.getmtime(recente) < 30:
+                # Verifica se terminou de baixar (.crdownload some)
+                if ".crdownload" not in recente:
+                    print(f"✅ Arquivo capturado: {os.path.basename(recente)}")
+                    return recente
+        
+        time.sleep(1)
+    return None
+
+# --- 3. ROBÔ DE DOWNLOAD ---
+def buscar_diario():
+    url_portal = "https://atos.teresopolis.rj.gov.br/diario/"
+    driver = None
     
     try:
         driver = configurar_driver()
-        # Define limite de 60s para carregar a página (evita travamento infinito)
-        driver.set_page_load_timeout(60)
+        driver.set_page_load_timeout(120) # Tempo maior para servidor lento
         
-        print(f"🕵️  Navegando para: {url_portal}")
+        print(f"🕵️  Acessando portal...")
         driver.get(url_portal)
         
-        print("--- ETAPA 2: BUSCANDO EDIÇÃO ---")
-        wait = WebDriverWait(driver, 30) # Espera máxima de 30s pela lista
+        wait = WebDriverWait(driver, 30)
         
-        # Procura linhas que contenham "Edição" e "Regular" ou "Extraordinário"
-        xpath_linha = "//*[contains(text(), 'Edição') and (contains(text(), 'Regular') or contains(text(), 'Extra'))]"
+        # Espera lista carregar
+        print("⏳ Aguardando lista de edições...")
+        xpath_linha = "//*[contains(text(), 'Edição') and contains(text(), 'Ano')]"
+        wait.until(EC.presence_of_element_located((By.XPATH, xpath_linha)))
+        elementos = driver.find_elements(By.XPATH, xpath_linha)
         
-        try:
-            wait.until(EC.presence_of_element_located((By.XPATH, xpath_linha)))
-            elementos = driver.find_elements(By.XPATH, xpath_linha)
-        except:
-            print("❌ Tempo esgotado: A lista de diários não carregou.")
-            return None, None
-        
-        print(f"📋 Encontrados {len(elementos)} itens. Filtrando 2026...")
-        
+        # Filtro de Ano (2026)
         alvo = None
-        # Pega o primeiro item da lista que seja de 2026 (assumindo ordem decrescente do site)
         for elem in elementos:
             if "2026" in elem.text:
                 alvo = elem
                 break
-        
-        if not alvo and elementos:
-            print("⚠️ Nenhuma edição de 2026 encontrada. Pegando a mais recente disponível.")
-            alvo = elementos[0]
+        if not alvo and elementos: alvo = elementos[0]
 
         if alvo:
-            print(f"🎯 Alvo Selecionado: '{alvo.text}'")
+            texto_alvo = alvo.text
+            print(f"🎯 Alvo encontrado: '{texto_alvo}'")
             
-            # Clica para ativar a sessão e gerar a URL
+            # Clica para abrir visualizador
             driver.execute_script("arguments[0].click();", alvo)
-            time.sleep(5) # Espera breve para URL atualizar
+            print("⏳ Aguardando visualizador (15s)...")
+            time.sleep(15) 
             
-            url_atual = driver.current_url
-            id_diario = url_atual.split("/")[-1] if "/diario/" in url_atual else None
+            # Tenta clicar no botão de download (Estratégia Vencedora)
+            print("👇 Tentando clicar no botão de Download...")
             
-            if id_diario and id_diario.isdigit():
-                link_api = f"https://atos.teresopolis.rj.gov.br/api/editions/download/{id_diario}"
-                print(f"--- ETAPA 3: DOWNLOAD DO ARQUIVO (ID: {id_diario}) ---")
-                
-                # Roubo de Cookies para Autenticação
-                selenium_cookies = driver.get_cookies()
-                session = requests.Session()
-                for cookie in selenium_cookies:
-                    session.cookies.set(cookie['name'], cookie['value'])
-                
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Referer": url_portal
+            # Tenta via JS primeiro (mais garantido em headless)
+            clicou = driver.execute_script("""
+                var btn = document.querySelector('a[download]') || 
+                          document.querySelector('button[title="Download"]') ||
+                          document.querySelector('#download');
+                if(btn) {
+                    btn.click();
+                    return true;
                 }
-                
-                print("⬇️ Baixando...")
-                # timeout=60 é CRUCIAL para não travar o robô se o servidor falhar
-                response = session.get(link_api, headers=headers, stream=True, verify=False, timeout=60)
-                
-                if response.status_code == 200:
-                    with open(caminho_pdf, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    
-                    tamanho = os.path.getsize(caminho_pdf)
-                    print(f"📦 Download concluído. Tamanho: {tamanho} bytes")
-                    
-                    if tamanho > 3000: # Validando tamanho mínimo (3KB)
-                        return caminho_pdf, url_atual
-                    else:
-                        print("❌ Arquivo muito pequeno (provavelmente corrompido ou erro de login).")
-                else:
-                    print(f"❌ Erro no servidor: Código {response.status_code}")
-            else:
-                print("❌ Não foi possível capturar o ID da edição.")
-        else:
-            print("❌ Nenhuma edição encontrada na página.")
+                return false;
+            """)
             
+            if not clicou:
+                print("⚠️ Botão JS falhou. Tentando via Selenium...")
+                try:
+                    btns = driver.find_elements(By.CSS_SELECTOR, "a[download], button[title='Download']")
+                    if btns: btns[0].click()
+                except: pass
+            
+            # Espera o arquivo cair na pasta
+            arquivo_baixado = esperar_download(os.getcwd())
+            
+            if arquivo_baixado:
+                # Renomeia para padronizar
+                novo_nome = os.path.join(os.getcwd(), "diario_hoje.pdf")
+                if os.path.exists(novo_nome): os.remove(novo_nome)
+                os.rename(arquivo_baixado, novo_nome)
+                return novo_nome, driver.current_url
+            else:
+                print("❌ Timeout: O arquivo não apareceu na pasta.")
+        else:
+            print("❌ Nenhuma edição encontrada na lista.")
+
         return None, None
 
     except Exception as e:
-        print(f"❌ ERRO CRÍTICO: {e}")
+        print(f"❌ Erro Crítico: {e}")
         return None, None
     finally:
-        if driver:
-            driver.quit()
+        if driver: driver.quit()
 
-# --- 3. EXTRATOR ---
+# --- 4. EXTRATOR ---
 def extrair_texto(caminho):
-    print("--- ETAPA 4: EXTRAÇÃO DE TEXTO ---")
+    print("📖 Extraindo texto...")
     try:
         text = ""
         with pdfplumber.open(caminho) as pdf:
-            # Limita a 5 páginas para não estourar memória se o PDF for gigante
-            for page in pdf.pages[:10]: 
+            # Lê até 25 páginas
+            for page in pdf.pages[:25]: 
                 text += page.extract_text() or ""
         return text[:100000]
     except Exception as e:
-        print(f"❌ Erro ao ler PDF: {e}")
+        print(f"❌ Erro PDF: {e}")
         return ""
 
-# --- 4. IA ---
+# --- 5. IA ---
 def analisar(texto):
-    print("--- ETAPA 5: ANÁLISE IA ---")
+    print("🧠 Analisando com GPT...")
     prompt = """
-    Você é um monitor de Licitações. Analise o texto do Diário Oficial de Teresópolis.
+    Analise o texto do Diário Oficial de Teresópolis-RJ.
+    OBJETIVO: Identificar oportunidades de VENDAS para empresas (Licitações).
     
-    O QUE BUSCAR:
-    - Licitações, Pregões, Tomadas de Preço, Chamamentos Públicos.
-    - Contratos assinados de alto valor.
-    - Oportunidades comerciais para empresas.
+    BUSQUE:
+    - Avisos de Licitação (Pregão, Tomada de Preços, Concorrência).
+    - Chamamentos Públicos.
+    - Dispensas de Licitação (compras diretas).
     
-    O QUE IGNORAR:
-    - Nomeações, Exonerações, Férias, Licenças médicas, Decretos de Ponto Facultativo.
+    IGNORE:
+    - Nomeações, Exonerações, Férias, Licenças.
+    - Decretos de Ponto Facultativo.
     
-    FORMATO DE SAÍDA (Se encontrar algo):
-    🚨 **[Nicho]** (Ex: Obras, TI, Alimentos)
-    📦 **Objeto:** Resumo do que é.
-    💰 **Valor:** R$ X (se disponível)
+    SAÍDA (Markdown):
+    🚨 **[TIPO]** Resumo curto do objeto
+    💰 **Valor:** R$ X (se houver)
+    📅 **Data:** Data da sessão (se houver)
     
-    FORMATO DE SAÍDA (Se não houver NADA relevante):
-    Responda apenas: "ND"
+    Se não houver NADA comercial, responda apenas: "ND"
     """
     try:
         resp = client.chat.completions.create(
@@ -188,54 +209,44 @@ def analisar(texto):
             temperature=0.3
         )
         return resp.choices[0].message.content
-    except Exception as e:
-        print(f"Erro IA: {e}")
-        return "ND"
+    except: return "ND"
 
-# --- 5. TELEGRAM ---
+# --- 6. TELEGRAM ---
 def enviar_telegram(msg, link):
-    print("--- ETAPA 6: ENVIO TELEGRAM ---")
+    print("📲 Enviando Telegram...")
+    data_hoje = time.strftime("%d/%m")
     
-    # Se a mensagem for ND, montamos um relatório de "Nada Consta"
-    if not msg or "ND" in msg or len(msg) < 5:
-        texto = (
-            f"📊 *Monitor Teresópolis*\n"
-            f"✅ Monitoramento finalizado.\n"
-            f"ℹ️ Nenhuma oportunidade comercial identificada hoje.\n"
-            f"🔗 [Acessar Documento]({link})"
-        )
+    if not msg or "ND" in msg or len(msg) < 10:
+        texto = f"📊 *Monitor Teresópolis* ({data_hoje})\n✅ Diário verificado.\nℹ️ Nenhuma licitação nova encontrada.\n🔗 [Link Oficial]({link})"
     else:
-        texto = (
-            f"📊 *Monitor Teresópolis*\n"
-            f"🚀 *Oportunidades Encontradas!*\n\n"
-            f"{msg}\n\n"
-            f"🔗 [Baixar Edital]({link})"
-        )
+        texto = f"📊 *Monitor Teresópolis* ({data_hoje})\n🚀 *Oportunidades Encontradas!*\n\n{msg}\n\n🔗 [Link Oficial]({link})"
         
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": texto,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True
-        }, timeout=10)
+            "text": texto, "parse_mode": "Markdown", "disable_web_page_preview": True
+        })
         print("✅ Mensagem enviada!")
     except Exception as e:
-        print(f"❌ Falha no envio: {e}")
+        print(f"❌ Erro Telegram: {e}")
 
 def main():
-    pdf, link = buscar_e_baixar_diario()
-    if pdf and link:
+    print("--- INICIANDO BOT GITHUB ---")
+    pdf, link = buscar_diario()
+    
+    if pdf:
         texto = extrair_texto(pdf)
-        if len(texto) > 100:
+        if len(texto) > 50:
             resumo = analisar(texto)
             enviar_telegram(resumo, link)
-            print("🏁 PROCESSO CONCLUÍDO COM SUCESSO.")
+            print("🏁 SUCESSO.")
         else:
-            print("⚠️ O PDF foi baixado, mas parece estar vazio ou ser apenas imagem.")
-            # Opcional: Avisar no telegram que houve erro de leitura
+            print("⚠️ PDF sem texto (Imagem?).")
+            enviar_telegram("⚠️ O Diário de hoje parece ser uma imagem digitalizada. Não consegui ler o texto.", link)
     else:
-        print("❌ PROCESSO ENCERRADO COM FALHA NO DOWNLOAD.")
+        print("❌ Falha no processo de download.")
+        # Opcional: Avisar erro no Telegram
+        # enviar_telegram("❌ Erro técnico ao tentar baixar o diário hoje.", "https://atos.teresopolis.rj.gov.br/diario/")
 
 if __name__ == "__main__":
     main()
