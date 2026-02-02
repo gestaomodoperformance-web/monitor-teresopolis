@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import pdfplumber
-import logging
+import base64
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -19,7 +19,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- 1. DRIVER BLINDADO ---
+# --- 1. DRIVER ---
 def configurar_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new") 
@@ -28,7 +28,7 @@ def configurar_driver():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--ignore-certificate-errors")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     try:
         caminho = ChromeDriverManager().install()
@@ -41,7 +41,7 @@ def configurar_driver():
     except:
         return webdriver.Chrome(options=chrome_options)
 
-# --- 2. SCRAPER COM INJEÇÃO JS (IONIC) ---
+# --- 2. SCRAPER ---
 def buscar_e_baixar_diario():
     url = "https://atos.teresopolis.rj.gov.br/diario/"
     caminho_pdf = "/tmp/diario_hoje.pdf" if os.name != 'nt' else "diario_hoje.pdf"
@@ -54,80 +54,106 @@ def buscar_e_baixar_diario():
         driver.set_page_load_timeout(90)
         driver.get(url)
         
-        print(f"📡 Título: {driver.title}")
-        print("⏳ Aguardando 20 segundos para o Ionic montar a tela...")
-        time.sleep(20) # Sites Ionic demoram para "hidratar" (montar) os botões
+        # Espera pelo texto chave que aparece nas linhas (ex: "Regular" ou "Ano")
+        wait = WebDriverWait(driver, 30)
+        print("⏳ Aguardando lista de edições...")
         
-        print("💉 Injetando JavaScript para caçar botões...")
+        # Estratégia Sniper: Espera aparecer qualquer elemento que contenha "Regular" ou "Extraordinário"
+        # Isso garante que a lista carregou
+        xpath_texto = "//*[contains(text(), 'Regular') or contains(text(), 'Extraordinário')]"
+        wait.until(EC.presence_of_element_located((By.XPATH, xpath_texto)))
         
-        # SCRIPT MÁGICO: Procura qualquer botão que tenha ícone de download/visualizar ou link de PDF
-        # Essa função roda DENTRO do navegador da prefeitura
-        link_encontrado = driver.execute_script("""
-            // Busca todos os botões e links do Ionic
-            var candidates = document.querySelectorAll('ion-button, a, button, ion-item');
+        print("✅ Lista carregada! Buscando a edição mais recente...")
+        
+        # Pega todos os elementos que têm esse texto (o primeiro costuma ser o mais recente no topo)
+        elementos = driver.find_elements(By.XPATH, xpath_texto)
+        
+        if elementos:
+            alvo = elementos[0] # Pega o primeiro da lista (topo)
+            print(f"🎯 Alvo encontrado: '{alvo.text}'")
             
-            for (var i = 0; i < candidates.length; i++) {
-                var el = candidates[i];
-                var html = el.outerHTML.toLowerCase();
-                var text = el.innerText.toLowerCase();
-                
-                // CRITÉRIOS DE DISPARO
-                // Procura por ícones comuns de PDF ou palavras chaves
-                if (html.includes('download') || 
-                    html.includes('pdf') || 
-                    html.includes('visualizar') || 
-                    html.includes('print') || 
-                    text.includes('visualizar') ||
-                    text.includes('abrir')) {
-                    
-                    // Se achou, clica e avisa o Python
-                    el.click();
-                    return "CLICADO";
-                }
-            }
-            return "NAO_ACHEI";
-        """)
-        
-        if link_encontrado == "CLICADO":
-            print("👆 JavaScript clicou em um botão candidato! Aguardando resposta...")
+            # Clica no alvo (pode ser a linha inteira)
+            driver.execute_script("arguments[0].click();", alvo)
+            print("👆 Clique realizado. Aguardando reação...")
             time.sleep(10)
             
-            # Verifica se abriu nova aba
+            # --- CENÁRIO A: Abriu nova aba (Link direto) ---
             if len(driver.window_handles) > 1:
                 driver.switch_to.window(driver.window_handles[-1])
-                print("📑 Nova aba detectada.")
-            
-            link_final = driver.current_url
-            print(f"🔗 URL Atual: {link_final}")
-            
-            # Tenta baixar o que estiver na URL (seja PDF ou blob)
-            # Se for blob, usamos requests com headers do browser
-            headers = {
-                "User-Agent": driver.execute_script("return navigator.userAgent;")
-            }
-            
-            resp = requests.get(link_final, headers=headers, stream=True, verify=False)
-            
-            # Salva sempre, depois tentamos ler
-            with open(caminho_pdf, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            # Verificação básica se baixou algo > 1kb
-            if os.path.getsize(caminho_pdf) > 1000:
-                print("💾 Arquivo salvo com sucesso.")
-                return caminho_pdf, link_final
+                link = driver.current_url
+                print(f"🔗 Nova aba detectada: {link}")
+                
+                # Baixa
+                resp = requests.get(link, stream=True, verify=False)
+                with open(caminho_pdf, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                return caminho_pdf, link
+
+            # --- CENÁRIO B: Abriu um visualizador na mesma tela (Blob/Embed) ---
             else:
-                print("⚠️ Arquivo baixado está vazio.")
-                return None, None
-        else:
-            print("❌ O JavaScript não encontrou nenhum botão óbvio de PDF.")
-            # Última tentativa: Printar o BODY para ver onde o botão se escondeu
-            # print(driver.find_element(By.TAG_NAME, "body").get_attribute('innerHTML')[:2000])
-            return None, None
+                print("🔗 Mesma aba. Verificando se é Blob ou PDF embutido...")
+                # Tenta extrair URL de algum embed/iframe
+                url_atual = driver.current_url
+                if "blob:" in url_atual or "pdf" in url_atual:
+                     print(f"🔗 URL Detectada: {url_atual}")
+                     # Se for blob, precisamos de JS para baixar
+                     if "blob:" in url_atual:
+                         print("⚡ Baixando BLOB via JavaScript...")
+                         js_download = """
+                            var uri = arguments[0];
+                            var callback = arguments[1];
+                            var xhr = new XMLHttpRequest();
+                            xhr.responseType = 'blob';
+                            xhr.onload = function() {
+                                var reader = new FileReader();
+                                reader.onloadend = function() {
+                                    callback(reader.result);
+                                }
+                                reader.readAsDataURL(xhr.response);
+                            };
+                            xhr.open('GET', uri);
+                            xhr.send();
+                         """
+                         uri = url_atual
+                         result = driver.execute_async_script(js_download, uri)
+                         # Salva o base64
+                         base64_data = result.split(',')[1]
+                         with open(caminho_pdf, 'wb') as f:
+                             f.write(base64.b64decode(base64_data))
+                         return caminho_pdf, url_atual
+                     else:
+                         # Download normal
+                         resp = requests.get(url_atual, stream=True, verify=False)
+                         with open(caminho_pdf, 'wb') as f:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                         return caminho_pdf, url_atual
+                
+                # CENÁRIO C: Clicou e abriu um Modal com botão "Baixar"
+                print("🔎 Procurando botão 'Baixar' ou ícone dentro de modal...")
+                try:
+                    botao_modal = driver.find_element(By.XPATH, "//*[contains(text(), 'Baixar') or contains(text(), 'Download')]")
+                    botao_modal.click()
+                    time.sleep(10)
+                    # Verifica abas de novo
+                    if len(driver.window_handles) > 1:
+                        driver.switch_to.window(driver.window_handles[-1])
+                        link = driver.current_url
+                        resp = requests.get(link, stream=True, verify=False)
+                        with open(caminho_pdf, 'wb') as f:
+                             for chunk in resp.iter_content(chunk_size=8192):
+                                 f.write(chunk)
+                        return caminho_pdf, link
+                except:
+                    pass
+
+        print("❌ Não consegui baixar. Dumping texto da tela para análise:")
+        print(driver.find_element(By.TAG_NAME, "body").text[:500])
+        return None, None
 
     except Exception as e:
-        print(f"❌ ERRO GERAL: {e}")
+        print(f"❌ ERRO: {e}")
         return None, None
     finally:
         if driver:
@@ -141,8 +167,7 @@ def extrair_texto(caminho):
             for page in pdf.pages:
                 text += page.extract_text() or ""
         return text[:100000]
-    except Exception as e:
-        print(f"⚠️ Erro leitura PDF: {e}")
+    except:
         return ""
 
 # --- 4. IA ---
@@ -180,15 +205,14 @@ def enviar_telegram(msg, link):
 def main():
     pdf, link = buscar_e_baixar_diario()
     if pdf and link:
-        texto = extrair_texto(pdf)
-        if len(texto) > 100: # Só analisa se tiver texto real
+        # Verifica tamanho
+        if os.path.exists(pdf) and os.path.getsize(pdf) > 1000:
+            texto = extrair_texto(pdf)
             resumo = analisar(texto)
             enviar_telegram(resumo, link)
             print("✅ FIM.")
         else:
-            print("⚠️ PDF parece ser imagem ou está vazio.")
-            # Envia aviso de erro no download/leitura
-            # enviar_telegram("ND", link) 
+             print("⚠️ Arquivo vazio ou corrompido.")
     else:
         print("❌ FALHA NO DOWNLOAD.")
 
