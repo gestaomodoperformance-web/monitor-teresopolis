@@ -1,9 +1,7 @@
 import os
 import time
-import base64
 import requests
 import pdfplumber
-from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -42,15 +40,10 @@ def configurar_driver():
     except:
         return webdriver.Chrome(options=chrome_options)
 
-# --- 2. SCRAPER (JS FETCH) ---
+# --- 2. SCRAPER (COOKIE STEALING) ---
 def buscar_e_baixar_diario():
     url_portal = "https://atos.teresopolis.rj.gov.br/diario/"
-    # Define caminho compatível com Windows e Linux
-    if os.name == 'nt':
-        caminho_pdf = "diario_hoje.pdf"
-    else:
-        caminho_pdf = "/tmp/diario_hoje.pdf"
-        
+    caminho_pdf = "diario_hoje.pdf" if os.name == 'nt' else "/tmp/diario_hoje.pdf"
     driver = None
     
     print(f"🕵️  Acessando: {url_portal}")
@@ -65,94 +58,82 @@ def buscar_e_baixar_diario():
         xpath_linha = "//*[contains(text(), 'Edição') and contains(text(), 'Ano')]"
         wait.until(EC.presence_of_all_elements_located((By.XPATH, xpath_linha)))
         
-        # --- LÓGICA DE ORDENAÇÃO ---
+        # --- CORREÇÃO DA LÓGICA DE DATA ---
         elementos = driver.find_elements(By.XPATH, xpath_linha)
         melhor_candidato = None
-        maior_edicao = 0
         
-        print(f"📋 Analisando {len(elementos)} edições encontradas...")
+        print(f"📋 Analisando {len(elementos)} edições...")
         
+        # Pega o PRIMEIRO item que contém "2026" (A lista já vem ordenada por data decrescente)
         for elem in elementos:
             texto = elem.text
-            # Ex: "Edição 22 / Ano 11..."
-            if "Edição" in texto and "202" in texto: 
-                try:
-                    num_edicao = int(texto.split("/")[0].replace("Edição", "").strip())
-                    if num_edicao > maior_edicao:
-                        maior_edicao = num_edicao
-                        melhor_candidato = elem
-                except:
-                    continue
+            if "2026" in texto:
+                melhor_candidato = elem
+                break # Achou o mais recente de 2026, para.
+        
+        # Se não achar 2026, tenta o primeiro da lista (fallback)
+        if not melhor_candidato and elementos:
+            melhor_candidato = elementos[0]
+            print("⚠️ Nenhuma de 2026 achada. Pegando a mais recente disponível.")
         
         if melhor_candidato:
-            print(f"🎯 Alvo Selecionado (Mais recente): '{melhor_candidato.text}'")
+            print(f"🎯 Alvo Selecionado: '{melhor_candidato.text}'")
             
-            # Clica para entrar na página de detalhes
+            # Clica para gerar o ID na URL
             driver.execute_script("arguments[0].click();", melhor_candidato)
             time.sleep(8)
             
-            # Pega o ID da URL
             url_atual = driver.current_url
             id_diario = None
             
-            # --- CORREÇÃO DO ERRO DE SINTAXE AQUI ---
             if "/diario/" in url_atual:
                 try:
-                    # Pega o último pedaço da URL (o número)
                     id_diario = url_atual.split("/")[-1]
                 except:
                     id_diario = None
             
             if id_diario and id_diario.isdigit():
                 link_api = f"https://atos.teresopolis.rj.gov.br/api/editions/download/{id_diario}"
-                print(f"⚡ URL da API identificada: {link_api}")
+                print(f"⚡ URL da API: {link_api}")
                 
-                # --- O GRANDE TRUQUE: JS FETCH ---
-                print("💉 Injetando JavaScript para download direto na memória RAM...")
+                # --- TÉCNICA: ROUBO DE COOKIES ---
+                print("🍪 Roubando cookies da sessão do Selenium...")
+                selenium_cookies = driver.get_cookies()
                 
-                script_download = """
-                    var url = arguments[0];
-                    var callback = arguments[1];
+                # Prepara a sessão do Requests
+                session = requests.Session()
+                for cookie in selenium_cookies:
+                    session.cookies.set(cookie['name'], cookie['value'])
+                
+                # Headers de navegador real
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://atos.teresopolis.rj.gov.br/diario/",
+                    "Accept": "application/pdf,application/octet-stream"
+                }
+                
+                print("⬇️ Baixando arquivo via Python (Requests)...")
+                response = session.get(link_api, headers=headers, stream=True, verify=False)
+                
+                if response.status_code == 200:
+                    with open(caminho_pdf, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                            
+                    tamanho = os.path.getsize(caminho_pdf)
+                    print(f"📦 Tamanho do arquivo: {tamanho} bytes")
                     
-                    fetch(url)
-                        .then(response => {
-                            if (!response.ok) throw new Error('Network response was not ok');
-                            return response.blob();
-                        })
-                        .then(blob => {
-                            var reader = new FileReader();
-                            reader.readAsDataURL(blob); 
-                            reader.onloadend = function() {
-                                callback(reader.result); // Retorna Base64 para o Python
-                            }
-                        })
-                        .catch(error => {
-                            callback("ERRO: " + error.message);
-                        });
-                """
-                
-                # Executa o script e espera o resultado
-                resultado_base64 = driver.execute_async_script(script_download, link_api)
-                
-                if resultado_base64 and "base64," in str(resultado_base64):
-                    # Decodifica e salva
-                    print("💾 Recebido arquivo codificado. Salvando no disco...")
-                    conteudo = base64.b64decode(resultado_base64.split(",")[1])
-                    
-                    with open(caminho_pdf, "wb") as f:
-                        f.write(conteudo)
-                        
-                    if os.path.getsize(caminho_pdf) > 2000:
-                        print("✅ PDF Salvo e Validado!")
+                    if tamanho > 2000:
+                        print("✅ PDF Baixado com Sucesso!")
                         return caminho_pdf, url_atual
                     else:
-                        print("❌ Arquivo salvo mas é muito pequeno/vazio.")
+                        print("❌ Arquivo baixado é muito pequeno (Erro de permissão?).")
                 else:
-                    print(f"❌ Falha no script JS: {resultado_base64}")
+                    print(f"❌ Erro HTTP: {response.status_code}")
             else:
-                print("❌ Não foi possível isolar o ID do diário na URL.")
+                print("❌ ID não encontrado na URL.")
         else:
-            print("❌ Nenhuma edição válida encontrada.")
+            print("❌ Nenhuma edição encontrada.")
             
         return None, None
 
@@ -224,6 +205,7 @@ def main():
             print("✅ CICLO FINALIZADO.")
         else:
             print("⚠️ PDF sem texto legível.")
+            # enviar_telegram("ND", link)
     else:
         print("❌ FALHA NO DOWNLOAD.")
 
