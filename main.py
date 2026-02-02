@@ -2,7 +2,6 @@ import os
 import time
 import requests
 import pdfplumber
-import logging
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -19,7 +18,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- 1. CONFIGURAÇÃO DO DRIVER ---
+# --- 1. DRIVER BLINDADO ---
 def configurar_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new") 
@@ -30,7 +29,6 @@ def configurar_driver():
     chrome_options.add_argument("--ignore-certificate-errors")
     chrome_options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    print("🚗 Configurando Driver...")
     try:
         caminho = ChromeDriverManager().install()
         if "THIRD_PARTY_NOTICES" in caminho:
@@ -39,81 +37,65 @@ def configurar_driver():
         os.chmod(caminho, 0o755)
         service = Service(executable_path=caminho)
         return webdriver.Chrome(service=service, options=chrome_options)
-    except Exception:
+    except:
         return webdriver.Chrome(options=chrome_options)
 
-# --- 2. SCRAPER TIPO "SCANNER" ---
+# --- 2. SCRAPER COM "RAIO-X" ---
 def buscar_e_baixar_diario():
-    url_sistema = "https://atos.teresopolis.rj.gov.br/diario/"
+    url = "https://atos.teresopolis.rj.gov.br/diario/"
     caminho_pdf = "/tmp/diario_hoje.pdf" if os.name != 'nt' else "diario_hoje.pdf"
     driver = None
     
-    print(f"🕵️  Acessando: {url_sistema}")
+    print(f"🕵️  Acessando: {url}")
     
     try:
         driver = configurar_driver()
-        driver.set_page_load_timeout(90)
-        driver.get(url_sistema)
+        driver.set_page_load_timeout(60)
+        driver.get(url)
         
         print(f"📡 Título: {driver.title}")
-        time.sleep(10) # Espera técnica para o Ionic "montar" a tela
-
-        # Tenta achar qualquer coisa que pareça um item de lista
-        print("🔍 Escaneando a página por links de PDF...")
+        time.sleep(15) # Espera GIGANTE para garantir que o Ionic carregou
         
-        # Pega TODOS os elementos 'a' (links) e 'button' (botões)
-        elementos = driver.find_elements(By.TAG_NAME, "a") + driver.find_elements(By.TAG_NAME, "button")
-        
-        link_candidato = None
-        
-        for elem in elementos:
-            try:
-                # Pega atributos para análise
-                href = elem.get_attribute("href") or ""
-                texto = elem.text.lower()
-                classe = elem.get_attribute("class") or ""
-                onclick = elem.get_attribute("onclick") or ""
+        # TENTATIVA 1: Busca por Ícones FontAwesome (Padrão Atos/Mentor)
+        print("🔍 Tentativa 1: Procurando ícones de PDF...")
+        try:
+            # Procura qualquer coisa que pareça um arquivo ou download
+            # fa-file-pdf, fa-download, fa-eye
+            xpath_icone = "//i[contains(@class, 'fa-file') or contains(@class, 'fa-download') or contains(@class, 'fa-eye')]"
+            icones = driver.find_elements(By.XPATH, xpath_icone)
+            
+            if icones:
+                print(f"✨ Encontrados {len(icones)} ícones. Clicando no primeiro...")
+                botao = icones[0]
+                # Clica no PAI do ícone (geralmente o botão)
+                driver.execute_script("arguments[0].parentNode.click();", botao)
+                time.sleep(10)
                 
-                # CRITÉRIOS DE BUSCA (O que define o botão certo?)
-                eh_pdf = ".pdf" in href
-                tem_download = "download" in href or "download" in classe or "download" in texto
-                eh_visualizar = "visualizar" in texto or "abrir" in texto
-                tem_icone = "fa-file-pdf" in classe or "ion-icon" in elem.get_attribute("innerHTML")
-                
-                # Se for um link http válido e tiver cara de PDF/Download
-                if href and "http" in href and (eh_pdf or tem_download or eh_visualizar):
-                    print(f"🎯 Candidato encontrado: {href}")
-                    link_candidato = href
-                    break # Pega o primeiro que achar (geralmente é o mais recente no topo)
-            except:
-                continue
-
-        # SE A BUSCA FALHAR, TENTA CLICAR NO PRIMEIRO ÍCONE VISÍVEL
-        if not link_candidato:
-            print("⚠️ Nenhum link óbvio. Tentando clicar no primeiro ícone da grade...")
-            # Busca genérica por ícones comuns no sistema Mentor/Atos
-            try:
-                # Tenta clicar no primeiro elemento clicável dentro da área de conteúdo
-                clicavel = driver.find_element(By.CSS_SELECTOR, "ion-row ion-col button, ion-row ion-col a, .fa-file-pdf")
-                driver.execute_script("arguments[0].click();", clicavel)
-                time.sleep(5)
+                # Verifica abas
                 if len(driver.window_handles) > 1:
                     driver.switch_to.window(driver.window_handles[-1])
-                link_candidato = driver.current_url
-            except Exception as e:
-                print(f"❌ Falha no clique de emergência: {e}")
+                
+                link = driver.current_url
+                print(f"🔗 Link capturado: {link}")
+                
+                # Download
+                resp = requests.get(link, stream=True)
+                if resp.status_code == 200:
+                    with open(caminho_pdf, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    return caminho_pdf, link
+        except Exception as e:
+            print(f"⚠️ Falha na busca por ícones: {e}")
 
-        if link_candidato:
-            print(f"🔗 Link Final: {link_candidato}")
-            resp = requests.get(link_candidato, stream=True)
-            if resp.status_code == 200:
-                with open(caminho_pdf, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                print("💾 PDF Salvo.")
-                return caminho_pdf, link_candidato
+        # SE FALHAR TUDO: MODALIDADE RAIO-X
+        print("❌ Não achei o botão. Iniciando RAIO-X da página...")
+        print("--- INÍCIO DO HTML (Copie isso se der erro) ---")
+        html = driver.page_source
+        # Imprime os primeiros 3000 caracteres para não poluir demais, mas mostrar a estrutura
+        print(html[:4000]) 
+        print("--- FIM DO HTML ---")
         
-        print("❌ Nenhum PDF encontrado no scanner.")
         return None, None
 
     except Exception as e:
@@ -138,10 +120,8 @@ def extrair_texto(caminho):
 def analisar(texto):
     print("🧠 Analisando...")
     prompt = """
-    Analise o texto do Diário Oficial.
-    Busque: Licitações, Pregões, Chamamentos, Obras.
-    Ignore: Atos de RH.
-    Se encontrar, liste: 🚨 [Nicho] | 📦 Objeto | 💰 Valor.
+    Analise o texto. Busque: Licitações, Pregões, Chamamentos.
+    Se encontrar: 🚨 [Nicho] | 📦 Objeto | 💰 Valor.
     Se nada: "ND"
     """
     try:
@@ -158,7 +138,7 @@ def analisar(texto):
 def enviar_telegram(msg, link):
     print("📲 Enviando...")
     texto = f"📊 *Monitor Teresópolis*\nℹ️ Sem oportunidades hoje.\n🔗 [Link]({link})"
-    if msg and "ND" not in msg and "Nenhuma" not in msg:
+    if msg and "ND" not in msg:
         texto = f"📊 *Monitor Teresópolis*\n🚀 *Oportunidades!*\n\n{msg}\n\n🔗 [Link]({link})"
         
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
