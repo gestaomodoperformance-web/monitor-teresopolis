@@ -1,7 +1,6 @@
 import os
 import time
-import json
-import requests
+import glob
 import pdfplumber
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -19,7 +18,17 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- 1. DRIVER COM ESCUTA DE REDE (A Mágica) ---
+# --- DEFINIR PASTA DE DOWNLOAD ---
+# No Linux (GitHub Actions), usamos /tmp. No Windows, pasta atual.
+if os.name == 'nt':
+    DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
+else:
+    DOWNLOAD_DIR = "/tmp"
+
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
+
+# --- 1. CONFIGURAÇÃO DO DRIVER (COM AUTO-DOWNLOAD) ---
 def configurar_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new") 
@@ -30,8 +39,16 @@ def configurar_driver():
     chrome_options.add_argument("--ignore-certificate-errors")
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    # ATIVANDO O LOG DE PERFORMANCE (Para interceptar o link do PDF)
-    chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+    # PREFERÊNCIAS DE DOWNLOAD (O Segredo)
+    prefs = {
+        "download.default_directory": DOWNLOAD_DIR,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "plugins.always_open_pdf_externally": True, # Força baixar PDF em vez de abrir no visualizador
+        "profile.default_content_settings.popups": 0,
+        "safebrowsing.enabled": True
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
     
     try:
         caminho = ChromeDriverManager().install()
@@ -44,41 +61,16 @@ def configurar_driver():
     except:
         return webdriver.Chrome(options=chrome_options)
 
-# --- 2. FUNÇÃO FAREJADORA ---
-def encontrar_pdf_nos_logs(driver):
-    print("👃 Farejando tráfego de rede em busca do PDF real...")
-    logs = driver.get_log('performance')
-    
-    candidatos = []
-    
-    for entry in logs:
-        try:
-            message = json.loads(entry['message'])['message']
-            
-            # Procura requisições de resposta (Response)
-            if message['method'] == 'Network.responseReceived':
-                url = message['params']['response']['url']
-                mime_type = message['params']['response']['mimeType']
-                
-                # O Pulo do Gato: Se o tipo for PDF ou a URL tiver cara de API de download
-                if "application/pdf" in mime_type or ".pdf" in url or "download" in url:
-                    # Ignora scripts .js ou css
-                    if ".js" not in url and ".css" not in url and ".html" not in url:
-                        candidatos.append(url)
-        except:
-            pass
-            
-    # Retorna o último encontrado (geralmente é o clique mais recente)
-    if candidatos:
-        return candidatos[-1]
-    return None
-
-# --- 3. SCRAPER PRINCIPAL ---
+# --- 2. SCRAPER ---
 def buscar_e_baixar_diario():
     url_portal = "https://atos.teresopolis.rj.gov.br/diario/"
-    caminho_pdf = "/tmp/diario_hoje.pdf" if os.name != 'nt' else "diario_hoje.pdf"
     driver = None
     
+    # Limpa a pasta de downloads antes de começar
+    for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*.pdf")):
+        try: os.remove(f)
+        except: pass
+
     print(f"🕵️  Acessando: {url_portal}")
     
     try:
@@ -86,78 +78,71 @@ def buscar_e_baixar_diario():
         driver.set_page_load_timeout(90)
         driver.get(url_portal)
         
-        # Espera lista carregar
+        # 1. Espera carregar a lista
         wait = WebDriverWait(driver, 30)
         print("⏳ Aguardando lista...")
         xpath_linha = "//*[contains(text(), 'Edição') and contains(text(), 'Ano')]"
         wait.until(EC.presence_of_all_elements_located((By.XPATH, xpath_linha)))
         
-        # Encontra o elemento
+        # 2. Encontra a edição recente
         elementos = driver.find_elements(By.XPATH, xpath_linha)
         alvo = None
         for elem in elementos:
+            # Pega o primeiro que tiver "202" (ano atual/recente)
             if elem.text and "202" in elem.text:
                 alvo = elem
                 break
         
         if alvo:
             print(f"🎯 Clicando em: '{alvo.text}'")
-            # Limpa os logs antigos antes de clicar
-            driver.get_log('performance')
-            
-            # Clica
             driver.execute_script("arguments[0].click();", alvo)
             
-            print("⏳ Aguardando requisição do arquivo (15s)...")
-            time.sleep(15)
+            # 3. Espera a mudança de URL para pegar o ID
+            print("⏳ Aguardando carregamento do visualizador...")
+            time.sleep(10)
             
-            # TENTA FAREJAR A URL REAL NO NETWORK
-            url_real = encontrar_pdf_nos_logs(driver)
+            url_atual = driver.current_url
+            print(f"🔗 URL Atual: {url_atual}")
             
-            # SE NÃO ACHOU NO LOG, TENTA MONTAR A URL DA API (Plano B)
-            if not url_real:
-                # O URL atual é .../diario/3240. O ID é 3240.
-                url_atual = driver.current_url
-                if "/diario/" in url_atual:
-                    try:
-                        id_diario = url_atual.split("/")[-1]
-                        # Padrão comum da API da Atos/Mentor
-                        url_real = f"https://atos.teresopolis.rj.gov.br/api/editions/download/{id_diario}"
-                        print(f"⚠️ Log vazio. Tentando URL montada manualmente: {url_real}")
-                    except:
-                        pass
+            # Extrai o ID da URL (ex: .../diario/3236 -> 3236)
+            id_diario = None
+            if "/diario/" in url_atual:
+                try:
+                    parts = url_atual.split("/diario/")
+                    if len(parts) > 1:
+                        id_diario = parts[-1].split("/")[0] # Garante pegar só o número
+                except:
+                    pass
             
-            if url_real:
-                print(f"⬇️ Baixando URL Real: {url_real}")
+            if id_diario:
+                print(f"🆔 ID Identificado: {id_diario}")
                 
-                # Download com headers simulando o navegador
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Referer": "https://atos.teresopolis.rj.gov.br/"
-                }
+                # 4. FORÇA O NAVEGADOR A BAIXAR (Usando a sessão logada)
+                # Tenta URL de Download Direto
+                link_download = f"https://atos.teresopolis.rj.gov.br/api/editions/download/{id_diario}"
+                print(f"⬇️ Forçando navegador a ir para: {link_download}")
+                driver.get(link_download)
                 
-                resp = requests.get(url_real, headers=headers, stream=True, verify=False)
+                # Espera o arquivo aparecer na pasta
+                caminho_final = aguardar_download(DOWNLOAD_DIR)
                 
-                with open(caminho_pdf, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                # Se falhar, tenta URL alternativa (ViewPDF)
+                if not caminho_final:
+                    print("⚠️ Primeira tentativa falhou. Tentando rota alternativa 'viewPdf'...")
+                    link_view = f"https://atos.teresopolis.rj.gov.br/api/editions/viewPdf/{id_diario}"
+                    driver.get(link_view)
+                    caminho_final = aguardar_download(DOWNLOAD_DIR)
                 
-                # Verifica se o arquivo é válido (tem cabeçalho de PDF ou tamanho decente)
-                if os.path.exists(caminho_pdf) and os.path.getsize(caminho_pdf) > 2000:
-                    # Verifica cabeçalho do arquivo
-                    with open(caminho_pdf, 'rb') as f:
-                        header = f.read(4)
-                        if b'%PDF' in header:
-                            print("✅ Arquivo validado: É um PDF real!")
-                            return caminho_pdf, url_real
-                        else:
-                            print("⚠️ Arquivo baixado não começa com %PDF. Tentando ler mesmo assim...")
-                            return caminho_pdf, url_real
+                if caminho_final:
+                    print(f"💾 PDF Baixado com sucesso: {caminho_final}")
+                    return caminho_final, url_atual
                 else:
-                    print("❌ Arquivo baixado muito pequeno (provavelmente erro).")
+                    print("❌ O navegador não salvou nenhum arquivo.")
             else:
-                print("❌ Não foi possível interceptar a URL do PDF.")
-        
+                print("❌ Não consegui extrair o ID da edição da URL.")
+        else:
+            print("❌ Nenhuma edição recente encontrada na lista.")
+            
         return None, None
 
     except Exception as e:
@@ -167,7 +152,24 @@ def buscar_e_baixar_diario():
         if driver:
             driver.quit()
 
-# --- 4. EXTRATOR ---
+# --- FUNÇÃO AUXILIAR: ESPERAR DOWNLOAD ---
+def aguardar_download(pasta, timeout=30):
+    print("⏳ Verificando pasta de downloads...")
+    fim = time.time() + timeout
+    while time.time() < fim:
+        arquivos = glob.glob(os.path.join(pasta, "*.pdf"))
+        if arquivos:
+            # Pega o arquivo mais recente
+            arquivo_mais_recente = max(arquivos, key=os.path.getctime)
+            # Verifica se terminou de baixar (não tem .crdownload)
+            if not arquivo_mais_recente.endswith(".crdownload"):
+                # Verifica tamanho (> 1KB)
+                if os.path.getsize(arquivo_mais_recente) > 1000:
+                    return arquivo_mais_recente
+        time.sleep(1)
+    return None
+
+# --- 3. EXTRATOR ---
 def extrair_texto(caminho):
     try:
         text = ""
@@ -179,7 +181,7 @@ def extrair_texto(caminho):
         print(f"❌ Erro leitura PDF: {e}")
         return ""
 
-# --- 5. IA ---
+# --- 4. IA ---
 def analisar(texto):
     print("🧠 Analisando...")
     prompt = """
@@ -204,7 +206,7 @@ def analisar(texto):
     except:
         return "ND"
 
-# --- 6. TELEGRAM ---
+# --- 5. TELEGRAM ---
 def enviar_telegram(msg, link):
     print("📲 Enviando Telegram...")
     texto = f"📊 *Monitor Teresópolis*\nℹ️ Nenhuma oportunidade comercial hoje.\n🔗 [Link]({link})"
@@ -228,6 +230,7 @@ def main():
             print("✅ SUCESSO TOTAL.")
         else:
             print("⚠️ PDF sem texto legível.")
+            # enviar_telegram("ND", link) # Opcional: avisar erro
     else:
         print("❌ FALHA NO DOWNLOAD.")
 
