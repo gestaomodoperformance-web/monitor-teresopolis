@@ -18,52 +18,74 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- 1. CONFIGURAÇÃO DO DRIVER (Navegador Invisível) ---
+# --- 1. CONFIGURAÇÃO DO DRIVER (COM CORREÇÃO DE BUG LINUX) ---
 def configurar_driver():
     chrome_options = Options()
-    chrome_options.add_argument("--headless") # Roda sem abrir janela (essencial para servidor)
+    chrome_options.add_argument("--headless") 
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-    # User-Agent para não ser bloqueado como bot
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    service = Service(ChromeDriverManager().install())
+    print("🚗 Configurando Driver...")
+    try:
+        # Tenta baixar a versão mais recente
+        caminho_driver = ChromeDriverManager().install()
+        
+        # --- CORREÇÃO DO BUG "THIRD_PARTY_NOTICES" ---
+        # Se o gerenciador apontar para o arquivo de texto, forçamos o executável
+        if "THIRD_PARTY_NOTICES" in caminho_driver:
+            print("⚠️ Caminho incorreto detectado (Bug do Linux). Corrigindo...")
+            pasta_driver = os.path.dirname(caminho_driver)
+            caminho_driver = os.path.join(pasta_driver, "chromedriver")
+        
+        # Garante que o arquivo é executável (Permissão Linux)
+        try:
+            os.chmod(caminho_driver, 0o755)
+        except:
+            pass
+            
+        service = Service(executable_path=caminho_driver)
+        
+    except Exception as e:
+        print(f"⚠️ Erro no gerenciador automático: {e}")
+        print("🔄 Tentando usar driver do sistema...")
+        # Fallback: Se tudo falhar, tenta usar o driver instalado pelo GitHub Actions (setup-chrome)
+        service = Service()
+
     return webdriver.Chrome(service=service, options=chrome_options)
 
 # --- 2. ROBÔ DE DOWNLOAD (Scraper) ---
 def buscar_e_baixar_diario():
     url_sistema = "https://atos.teresopolis.rj.gov.br/diario/"
-    driver = configurar_driver()
     
-    # Define onde salvar (Linux/Server usa /tmp, Windows local usa pasta atual)
+    # Define onde salvar
     if os.name == 'nt':
         caminho_pdf = "diario_hoje.pdf"
     else:
         caminho_pdf = "/tmp/diario_hoje.pdf"
         
     link_final = None
+    driver = None
     
     print(f"🕵️  Acessando Portal: {url_sistema}")
     
     try:
+        driver = configurar_driver()
         driver.get(url_sistema)
         wait = WebDriverWait(driver, 30)
         
-        # Espera a tabela de documentos carregar
+        # Espera a tabela
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
         print("✅ Tabela encontrada. Buscando edição mais recente...")
         
-        # Estratégia Blindada: Busca botões, links ou ícones na primeira linha da tabela
         xpath_botao = "//tbody/tr[1]//button | //tbody/tr[1]//a[contains(@class, 'btn') or .//i]"
         botao = wait.until(EC.element_to_be_clickable((By.XPATH, xpath_botao)))
         
-        # Rola a tela até o botão e clica
         driver.execute_script("arguments[0].scrollIntoView();", botao)
         time.sleep(1)
         botao.click()
         
-        # Espera para ver se abriu nova aba (comportamento comum do sistema Atos)
         time.sleep(5)
         if len(driver.window_handles) > 1:
             driver.switch_to.window(driver.window_handles[-1])
@@ -71,7 +93,6 @@ def buscar_e_baixar_diario():
         link_final = driver.current_url
         print(f"🔗 Link capturado: {link_final}")
         
-        # Faz o download do PDF
         response = requests.get(link_final, stream=True)
         if response.status_code == 200:
             with open(caminho_pdf, 'wb') as f:
@@ -87,7 +108,8 @@ def buscar_e_baixar_diario():
         print(f"❌ Erro durante o scraping: {e}")
         return None, None
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
 # --- 3. EXTRATOR DE TEXTO ---
 def extrair_texto_relevante(caminho_pdf):
@@ -95,10 +117,8 @@ def extrair_texto_relevante(caminho_pdf):
     texto_bruto = ""
     try:
         with pdfplumber.open(caminho_pdf) as pdf:
-            # Lê todas as páginas
             for page in pdf.pages:
                 texto_bruto += page.extract_text() + "\n"
-        # Limita a 100k caracteres para não estourar a memória da IA
         return texto_bruto[:100000] 
     except Exception as e:
         print(f"❌ Erro ao ler PDF: {e}")
@@ -144,9 +164,7 @@ def analisar_oportunidades(texto_diario):
 def enviar_telegram(mensagem, link_original):
     print("📲 Preparando envio para o Telegram...")
     
-    # Lógica de decisão: Mensagem Positiva ou Negativa?
     if not mensagem or mensagem.strip() == "ND" or "Nenhuma oportunidade" in mensagem:
-        # MENSAGEM NEGATIVA (Heartbeat) - Mantém o cliente informado
         msg_final = (
             f"📊 *Monitor Estratégico Teresópolis* \n"
             f"📅 *Relatório Diário*\n\n"
@@ -155,12 +173,10 @@ def enviar_telegram(mensagem, link_original):
             f"🔗 [Acessar Documento Oficial]({link_original})"
         )
     else:
-        # MENSAGEM POSITIVA (Oportunidades)
         cabecalho = f"📊 *Monitor Estratégico Teresópolis* \n🚀 *Novas Oportunidades Detectadas!* \n\n"
         rodape = f"\n🔗 [Baixar Edital Completo]({link_original})"
         msg_final = cabecalho + mensagem + rodape
     
-    # Disparo
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -191,8 +207,7 @@ def main():
         else:
             print("⚠️ PDF estava vazio ou ilegível.")
     else:
-        # Opcional: Avisar no Telegram se o site da prefeitura estiver fora do ar
-        print("⚠️ Não foi possível baixar o Diário hoje (Site instável ou layout mudou).")
+        print("⚠️ Não foi possível baixar o Diário hoje.")
 
 if __name__ == "__main__":
     main()
