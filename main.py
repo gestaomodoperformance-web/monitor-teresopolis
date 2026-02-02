@@ -19,108 +19,105 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- 1. CONFIGURAÇÃO "TANQUE DE GUERRA" DO DRIVER ---
+# --- 1. CONFIGURAÇÃO DO DRIVER ---
 def configurar_driver():
     chrome_options = Options()
-    # Modo Headless Novo (Mais estável)
     chrome_options.add_argument("--headless=new") 
-    
-    # Lista de flags para evitar crash em servidor Linux
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--disable-software-rasterizer")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--ignore-certificate-errors")
-    
-    # User-Agent comum para não parecer robô
     chrome_options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    print("🚗 Configurando Driver Blindado...")
+    print("🚗 Configurando Driver...")
     try:
-        # Tenta instalação padrão
         caminho = ChromeDriverManager().install()
-        
-        # Correção do bug de caminho do Linux (Third Party Notices)
         if "THIRD_PARTY_NOTICES" in caminho:
             pasta = os.path.dirname(caminho)
             caminho = os.path.join(pasta, "chromedriver")
-        
-        # Força permissão de execução
         os.chmod(caminho, 0o755)
-        
         service = Service(executable_path=caminho)
         return webdriver.Chrome(service=service, options=chrome_options)
-    except Exception as e:
-        print(f"⚠️ Erro no Manager: {e}. Tentando driver nativo...")
+    except Exception:
         return webdriver.Chrome(options=chrome_options)
 
-# --- 2. SCRAPER ---
+# --- 2. SCRAPER TIPO "SCANNER" ---
 def buscar_e_baixar_diario():
     url_sistema = "https://atos.teresopolis.rj.gov.br/diario/"
-    
-    if os.name == 'nt':
-        caminho_pdf = "diario_hoje.pdf"
-    else:
-        caminho_pdf = "/tmp/diario_hoje.pdf"
-        
+    caminho_pdf = "/tmp/diario_hoje.pdf" if os.name != 'nt' else "diario_hoje.pdf"
     driver = None
     
     print(f"🕵️  Acessando: {url_sistema}")
     
     try:
         driver = configurar_driver()
-        driver.set_page_load_timeout(60) # Limite de 60s para carregar
+        driver.set_page_load_timeout(90)
         driver.get(url_sistema)
         
-        # --- DIAGNÓSTICO ---
-        print(f"📡 Título da Página capturado: {driver.title}")
-        # -------------------
+        print(f"📡 Título: {driver.title}")
+        time.sleep(10) # Espera técnica para o Ionic "montar" a tela
 
-        wait = WebDriverWait(driver, 30)
+        # Tenta achar qualquer coisa que pareça um item de lista
+        print("🔍 Escaneando a página por links de PDF...")
         
-        print("⏳ Aguardando tabela...")
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
-        print("✅ Tabela encontrada!")
+        # Pega TODOS os elementos 'a' (links) e 'button' (botões)
+        elementos = driver.find_elements(By.TAG_NAME, "a") + driver.find_elements(By.TAG_NAME, "button")
         
-        # Clica no primeiro botão disponível
-        xpath_botao = "//tbody/tr[1]//*[self::a or self::button]"
-        botao = wait.until(EC.element_to_be_clickable((By.XPATH, xpath_botao)))
+        link_candidato = None
         
-        # Tenta pegar link direto
-        link_final = botao.get_attribute('href')
-        
-        if not link_final or "http" not in link_final:
-            print("🖱️ Clicando para descobrir link...")
-            driver.execute_script("arguments[0].click();", botao)
-            time.sleep(5)
-            if len(driver.window_handles) > 1:
-                driver.switch_to.window(driver.window_handles[-1])
-            link_final = driver.current_url
-            
-        print(f"🔗 Link Final: {link_final}")
-        
-        # Download
-        resp = requests.get(link_final, stream=True)
-        if resp.status_code == 200:
-            with open(caminho_pdf, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print("💾 PDF Salvo.")
-            return caminho_pdf, link_final
-            
-    except Exception as e:
-        print(f"❌ ERRO FATAL: {e}")
-        # DEBUG: Se falhar, mostra o código da página para sabermos o motivo
-        if driver:
+        for elem in elementos:
             try:
-                print("--- DEBUG HTML (INÍCIO) ---")
-                print(driver.page_source[:1000]) # Imprime os primeiros 1000 caracteres
-                print("--- DEBUG HTML (FIM) ---")
+                # Pega atributos para análise
+                href = elem.get_attribute("href") or ""
+                texto = elem.text.lower()
+                classe = elem.get_attribute("class") or ""
+                onclick = elem.get_attribute("onclick") or ""
+                
+                # CRITÉRIOS DE BUSCA (O que define o botão certo?)
+                eh_pdf = ".pdf" in href
+                tem_download = "download" in href or "download" in classe or "download" in texto
+                eh_visualizar = "visualizar" in texto or "abrir" in texto
+                tem_icone = "fa-file-pdf" in classe or "ion-icon" in elem.get_attribute("innerHTML")
+                
+                # Se for um link http válido e tiver cara de PDF/Download
+                if href and "http" in href and (eh_pdf or tem_download or eh_visualizar):
+                    print(f"🎯 Candidato encontrado: {href}")
+                    link_candidato = href
+                    break # Pega o primeiro que achar (geralmente é o mais recente no topo)
             except:
-                pass
+                continue
+
+        # SE A BUSCA FALHAR, TENTA CLICAR NO PRIMEIRO ÍCONE VISÍVEL
+        if not link_candidato:
+            print("⚠️ Nenhum link óbvio. Tentando clicar no primeiro ícone da grade...")
+            # Busca genérica por ícones comuns no sistema Mentor/Atos
+            try:
+                # Tenta clicar no primeiro elemento clicável dentro da área de conteúdo
+                clicavel = driver.find_element(By.CSS_SELECTOR, "ion-row ion-col button, ion-row ion-col a, .fa-file-pdf")
+                driver.execute_script("arguments[0].click();", clicavel)
+                time.sleep(5)
+                if len(driver.window_handles) > 1:
+                    driver.switch_to.window(driver.window_handles[-1])
+                link_candidato = driver.current_url
+            except Exception as e:
+                print(f"❌ Falha no clique de emergência: {e}")
+
+        if link_candidato:
+            print(f"🔗 Link Final: {link_candidato}")
+            resp = requests.get(link_candidato, stream=True)
+            if resp.status_code == 200:
+                with open(caminho_pdf, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print("💾 PDF Salvo.")
+                return caminho_pdf, link_candidato
+        
+        print("❌ Nenhum PDF encontrado no scanner.")
+        return None, None
+
+    except Exception as e:
+        print(f"❌ ERRO GERAL: {e}")
         return None, None
     finally:
         if driver:
@@ -141,37 +138,27 @@ def extrair_texto(caminho):
 def analisar(texto):
     print("🧠 Analisando...")
     prompt = """
-    Analise o Diário Oficial de Teresópolis.
+    Analise o texto do Diário Oficial.
     Busque: Licitações, Pregões, Chamamentos, Obras.
-    Ignore: Atos de RH (Férias, Nomeações).
-    
-    Se achar, formato:
-    🚨 **[Nicho]**
-    📦 **Objeto:** ...
-    💰 **Valor:** ...
-    
+    Ignore: Atos de RH.
+    Se encontrar, liste: 🚨 [Nicho] | 📦 Objeto | 💰 Valor.
     Se nada: "ND"
     """
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": texto}
-            ],
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": texto}],
             temperature=0.3
         )
         return resp.choices[0].message.content
-    except Exception as e:
-        print(f"Erro IA: {e}")
+    except:
         return "ND"
 
 # --- 5. TELEGRAM ---
 def enviar_telegram(msg, link):
     print("📲 Enviando...")
-    if not msg or "ND" in msg or "Nenhuma" in msg:
-        texto = f"📊 *Monitor Teresópolis*\n✅ Monitoramento realizado.\nℹ️ Nenhuma oportunidade comercial hoje.\n🔗 [Link]({link})"
-    else:
+    texto = f"📊 *Monitor Teresópolis*\nℹ️ Sem oportunidades hoje.\n🔗 [Link]({link})"
+    if msg and "ND" not in msg and "Nenhuma" not in msg:
         texto = f"📊 *Monitor Teresópolis*\n🚀 *Oportunidades!*\n\n{msg}\n\n🔗 [Link]({link})"
         
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
@@ -189,7 +176,7 @@ def main():
         enviar_telegram(resumo, link)
         print("✅ FIM.")
     else:
-        print("❌ FALHA GERAL.")
+        print("❌ FALHA NO DOWNLOAD.")
 
 if __name__ == "__main__":
     main()
