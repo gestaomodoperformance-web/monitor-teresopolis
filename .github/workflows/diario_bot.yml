@@ -9,6 +9,7 @@ on:
 jobs:
   rodar-robo:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # Mata o processo se travar por mais de 15 min
     
     steps:
       - name: Baixar Código
